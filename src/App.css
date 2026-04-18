@@ -45,7 +45,7 @@ body {
 
 .osd-container.hidden {
   opacity: 0;
-  display: none; /* 彻底移除渲染 */
+  pointer-events: none;
 }
 
 .osd-container.visible {

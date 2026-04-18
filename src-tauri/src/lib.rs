@@ -19,9 +19,10 @@ fn apply_volume_change(app: &AppHandle, delta: i32) {
         let current_vol = device.get_vol().unwrap_or(0) as i32;
         let mut new_vol_int = current_vol + delta;
         
-        // 优化取整逻辑：四舍五入到最近的 5 的倍数
+        // 优化取整逻辑：根据变化方向进行四舍五入
         if delta.abs() == 5 {
-            new_vol_int = ((new_vol_int + 2) / 5) * 5;
+            let offset = if delta > 0 { 2 } else { -2 };
+            new_vol_int = ((new_vol_int + offset) / 5) * 5;
         }
         let new_vol = new_vol_int.clamp(0, 100) as u8;
         
