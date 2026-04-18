@@ -5,13 +5,8 @@ use serde::Serialize;
 use std::thread;
 use std::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
-use windows::{
-    core::*,
-    Win32::Media::Audio::Endpoints::*,
-    Win32::Media::Audio::*,
-    Win32::System::Com::*,
-    Win32::UI::Input::KeyboardAndMouse::*,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use volumecontrol::AudioDevice;
 
 #[derive(Clone, Serialize)]
 struct VolumePayload {
@@ -19,28 +14,23 @@ struct VolumePayload {
     muted: bool,
 }
 
-fn get_current_volume_int(volume_interface: &IAudioEndpointVolume) -> i32 {
-    unsafe {
-        let vol_f = volume_interface.GetMasterVolumeLevelScalar().unwrap_or(0.0);
-        (vol_f * 100.0).round() as i32
-    }
-}
-
-fn apply_volume_change(volume_interface: &IAudioEndpointVolume, app: &AppHandle, delta: i32) {
-    unsafe {
-        let current_int = get_current_volume_int(volume_interface);
-        let mut new_vol_int = current_int + delta;
-        if delta.abs() == 5 {
-             new_vol_int = (new_vol_int / 5) * 5;
-        }
-        new_vol_int = new_vol_int.clamp(0, 100);
+fn apply_volume_change(app: &AppHandle, delta: i32) {
+    if let Ok(device) = AudioDevice::from_default() {
+        let current_vol = device.get_vol().unwrap_or(0) as i32;
+        let mut new_vol_int = current_vol + delta;
         
-        let _ = volume_interface.SetMasterVolumeLevelScalar(new_vol_int as f32 / 100.0, std::ptr::null());
-        let is_muted = volume_interface.GetMute().unwrap_or(false.into()).as_bool();
+        // 优化取整逻辑：四舍五入到最近的 5 的倍数
+        if delta.abs() == 5 {
+            new_vol_int = ((new_vol_int + 2) / 5) * 5;
+        }
+        let new_vol = new_vol_int.clamp(0, 100) as u8;
+        
+        let _ = device.set_vol(new_vol);
+        let is_muted = device.is_mute().unwrap_or(false);
         
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.emit("volume-changed", VolumePayload {
-                volume: new_vol_int as u8,
+                volume: new_vol,
                 muted: is_muted,
             });
             let _ = window.center();
@@ -49,29 +39,18 @@ fn apply_volume_change(volume_interface: &IAudioEndpointVolume, app: &AppHandle,
     }
 }
 
-fn get_volume_interface() -> Result<IAudioEndpointVolume> {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
-        device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-    }
-}
-
 fn toggle_mute(app: &AppHandle) {
-    if let Ok(volume_interface) = get_volume_interface() {
-        unsafe {
-            let is_muted = volume_interface.GetMute().unwrap_or(false.into()).as_bool();
-            let _ = volume_interface.SetMute(!is_muted, std::ptr::null());
-            let current_vol = get_current_volume_int(&volume_interface) as u8;
-            
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.emit("volume-changed", VolumePayload {
-                    volume: current_vol,
-                    muted: !is_muted,
-                });
-                let _ = window.show();
-            }
+    if let Ok(device) = AudioDevice::from_default() {
+        let is_muted = device.is_mute().unwrap_or(false);
+        let _ = device.set_mute(!is_muted);
+        let current_vol = device.get_vol().unwrap_or(0);
+        
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.emit("volume-changed", VolumePayload {
+                volume: current_vol,
+                muted: !is_muted,
+            });
+            let _ = window.show();
         }
     }
 }
@@ -87,14 +66,12 @@ fn handle_hold(app: AppHandle, delta: i32, key: VIRTUAL_KEY) {
     
     thread::spawn(move || {
         IS_ADJUSTING.store(true, Ordering::SeqCst);
-        if let Ok(volume_interface) = get_volume_interface() {
-            apply_volume_change(&volume_interface, &app, delta);
-            thread::sleep(Duration::from_millis(400));
-            
-            while is_key_down(key) && is_key_down(VK_CONTROL) && is_key_down(VK_MENU) {
-                apply_volume_change(&volume_interface, &app, delta);
-                thread::sleep(Duration::from_millis(150));
-            }
+        apply_volume_change(&app, delta);
+        thread::sleep(Duration::from_millis(400));
+        
+        while is_key_down(key) && is_key_down(VK_CONTROL) && is_key_down(VK_MENU) {
+            apply_volume_change(&app, delta);
+            thread::sleep(Duration::from_millis(150));
         }
         IS_ADJUSTING.store(false, Ordering::SeqCst);
     });
@@ -144,31 +121,29 @@ pub fn run() {
             let autostart_i_handle = autostart_i.clone();
             let menu = Menu::with_items(app, &[&autostart_i, &mute_i, &quit_i])?;
 
-            let _tray = TrayIconBuilder::new()
+            let mut tray_builder = TrayIconBuilder::new()
                 .menu(&menu)
-                .show_menu_on_left_click(false)
-                .icon(app.default_window_icon().unwrap().clone())
+                .show_menu_on_left_click(false);
+            
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray_builder = tray_builder.icon(icon);
+            }
+
+            let _tray = tray_builder
                 .on_menu_event(move |app, event| {
                     match event.id.as_ref() {
                         "quit" => { app.exit(0); }
                         "mute" => { toggle_mute(app); }
                         "autostart" => {
-                            // 直接查询插件的真实状态
                             let is_enabled = app.autolaunch().is_enabled().unwrap_or(false);
                             if is_enabled {
                                 match app.autolaunch().disable() {
-                                    Ok(_) => {
-                                        let _ = autostart_i_handle.set_checked(false);
-                                        println!("Autostart disabled successfully.");
-                                    },
+                                    Ok(_) => { let _ = autostart_i_handle.set_checked(false); },
                                     Err(e) => eprintln!("Failed to disable autostart: {}", e),
                                 }
                             } else {
                                 match app.autolaunch().enable() {
-                                    Ok(_) => {
-                                        let _ = autostart_i_handle.set_checked(true);
-                                        println!("Autostart enabled successfully.");
-                                    },
+                                    Ok(_) => { let _ = autostart_i_handle.set_checked(true); },
                                     Err(e) => eprintln!("Failed to enable autostart: {}", e),
                                 }
                             }
