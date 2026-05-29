@@ -16,23 +16,22 @@ struct VolumePayload {
 
 fn apply_volume_change(app: &AppHandle, delta: i32) {
     if let Ok(device) = AudioDevice::from_default() {
-        let current_vol = device.get_vol().unwrap_or(0) as i32;
-        let mut new_vol_int = current_vol + delta;
-        
-        // 优化取整逻辑：根据变化方向进行四舍五入
-        if delta.abs() == 5 {
-            let offset = if delta > 0 { 2 } else { -2 };
-            new_vol_int = ((new_vol_int + offset) / 5) * 5;
+        // 如果当前是静音状态，先取消静音
+        let is_muted = device.is_mute().unwrap_or(false);
+        if is_muted {
+            let _ = device.set_mute(false);
         }
-        let new_vol = new_vol_int.clamp(0, 100) as u8;
+        
+        let current_vol = device.get_vol().unwrap_or(0) as i32;
+        let new_vol = (current_vol + delta).clamp(0, 100) as u8;
         
         let _ = device.set_vol(new_vol);
-        let is_muted = device.is_mute().unwrap_or(false);
+        let final_muted = device.is_mute().unwrap_or(false);
         
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.emit("volume-changed", VolumePayload {
                 volume: new_vol,
-                muted: is_muted,
+                muted: final_muted,
             });
             let _ = window.center();
             let _ = window.show();
@@ -68,12 +67,18 @@ fn handle_hold(app: AppHandle, delta: i32, key: VIRTUAL_KEY) {
     thread::spawn(move || {
         IS_ADJUSTING.store(true, Ordering::SeqCst);
         apply_volume_change(&app, delta);
-        thread::sleep(Duration::from_millis(400));
         
-        while is_key_down(key) && is_key_down(VK_CONTROL) && is_key_down(VK_MENU) {
-            apply_volume_change(&app, delta);
-            thread::sleep(Duration::from_millis(150));
+        // 等待一小段时间后再检测是否长按，避免短按触发多次
+        thread::sleep(Duration::from_millis(300));
+        
+        // 只有在延迟后仍然按住快捷键时才继续调整
+        if is_key_down(key) && is_key_down(VK_CONTROL) && is_key_down(VK_MENU) {
+            while is_key_down(key) && is_key_down(VK_CONTROL) && is_key_down(VK_MENU) {
+                apply_volume_change(&app, delta);
+                thread::sleep(Duration::from_millis(150));
+            }
         }
+        
         IS_ADJUSTING.store(false, Ordering::SeqCst);
     });
 }
@@ -112,6 +117,8 @@ pub fn run() {
             let _ = app.global_shortcut().register(ctrl_alt_left);
 
             // Tray menu
+            let version_text = format!("版本 {}", env!("CARGO_PKG_VERSION"));
+            let version_i = MenuItem::with_id(app, "version", &version_text, false, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let mute_i = MenuItem::with_id(app, "mute", "静音/取消静音", true, None::<&str>)?;
             
@@ -120,7 +127,7 @@ pub fn run() {
             let autostart_i = CheckMenuItem::with_id(app, "autostart", "开机启动", true, is_enabled, None::<&str>)?;
             
             let autostart_i_handle = autostart_i.clone();
-            let menu = Menu::with_items(app, &[&autostart_i, &mute_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&autostart_i, &version_i, &mute_i, &quit_i])?;
 
             let mut tray_builder = TrayIconBuilder::new()
                 .menu(&menu)
