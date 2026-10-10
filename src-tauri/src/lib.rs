@@ -116,6 +116,17 @@ pub fn run() {
             let _ = app.global_shortcut().register(ctrl_alt_down);
             let _ = app.global_shortcut().register(ctrl_alt_left);
 
+            // 禁用 WebView2 默认右键菜单，避免透明 OSD 窗口上右键弹出浏览器菜单
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.with_webview(|webview| unsafe {
+                    let _ = webview
+                        .controller()
+                        .CoreWebView2()
+                        .and_then(|core| core.Settings())
+                        .and_then(|settings| settings.SetAreDefaultContextMenusEnabled(false));
+                });
+            }
+
             // Tray menu
             let version_text = format!("版本 {}", env!("CARGO_PKG_VERSION"));
             let version_i = MenuItem::with_id(app, "version", &version_text, false, None::<&str>)?;
