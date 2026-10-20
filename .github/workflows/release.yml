@@ -40,5 +40,5 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'VolumeOSD __VERSION__'
           releaseBody: 'Windows 安装包（.msi / .exe）见下方 Assets。'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
